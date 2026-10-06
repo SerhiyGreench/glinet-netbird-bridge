@@ -1,0 +1,15 @@
+Package: netbird-bridge
+Version: @VERSION@
+Depends: libc, ip-full, kmod-veth, kmod-wireguard, wireguard-tools, nftables, ethtool, curl, ca-bundle
+Source: https://github.com/SerhiyGreench/glinet-netbird-bridge
+SourceName: netbird-bridge
+License: MIT
+Section: net
+URL: https://github.com/SerhiyGreench/glinet-netbird-bridge
+Maintainer: Serhiy Morenko
+Architecture: all
+Installed-Size: @SIZE@
+Description: NetBird as a GL.iNet WireGuard client profile.
+ Runs NetBird in its own network namespace behind a local WireGuard server, and
+ adds a "NetBird" profile to the GL.iNet VPN client so every GL.iNet VPN feature
+ (per-device and per-domain policy, kill switch, VPN dashboard) applies to it.

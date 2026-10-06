@@ -1,0 +1,39 @@
+#!/bin/sh /etc/rc.common
+# shellcheck disable=SC2034 # read by rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+BRIDGE=/usr/sbin/netbird-bridge
+
+start_service() {
+	config_load netbird-bridge
+	local enabled netns
+	config_get_bool enabled main enabled 1
+	config_get netns main netns nbns
+	[ "$enabled" = 1 ] || return 0
+	[ -x /usr/bin/netbird ] || { logger -t netbird-bridge "NetBird is not installed; run: netbird-bridge setup"; return 0; }
+
+	$BRIDGE _start || return 1
+
+	procd_open_instance netbird
+	procd_set_param command /sbin/ip netns exec "$netns" /usr/bin/netbird service run --log-file syslog
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance watch
+	procd_set_param command $BRIDGE _watch
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+service_stopped() {
+	$BRIDGE _stop
+}
+
+service_triggers() {
+	procd_add_reload_trigger netbird-bridge
+}

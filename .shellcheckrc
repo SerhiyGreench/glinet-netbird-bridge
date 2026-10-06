@@ -1,0 +1,3 @@
+shell=sh
+# busybox ash supports local
+disable=SC3043

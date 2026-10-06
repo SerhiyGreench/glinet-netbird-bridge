@@ -1,0 +1,6 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+# opkg runs this on upgrade too; only tear down on a real removal.
+[ "$1" = upgrade ] && exit 0
+/usr/sbin/netbird-bridge uninstall
+exit 0

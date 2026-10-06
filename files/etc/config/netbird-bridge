@@ -1,0 +1,22 @@
+
+config bridge 'main'
+	option enabled '1'
+	# Name of the GL.iNet WireGuard client profile (and its group).
+	option profile_name 'NetBird'
+	# auto: first exit node NetBird offers; none: NetBird peers and routes only;
+	# or a NetBird network ID (see: netbird-bridge exit-node).
+	option exit_node 'auto'
+	# Port the bridge listens on, reached by GL.iNet's client at 127.0.0.1.
+	option listen_port '51830'
+	option mtu '1280'
+	# Addresses inside the bridge. Change them only if they clash with a network
+	# NetBird routes to.
+	option tunnel_ip '10.211.83.1/30'
+	option client_ip '10.211.83.2'
+	option veth_host_ip '169.254.83.1/30'
+	option veth_ns_ip '169.254.83.2/30'
+	option netns 'nbns'
+	# Resolvers NetBird itself uses to reach its management server.
+	option upstream_dns '1.1.1.1 9.9.9.9'
+	# Resolve NetBird peer names (e.g. peer.netbird.cloud) from every LAN device.
+	option lan_dns '1'

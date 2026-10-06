@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Shellcheck
+        run: |
+          shellcheck files/usr/sbin/netbird-bridge files/etc/init.d/netbird-bridge \
+            install.sh scripts/build-ipk.sh package/postinst package/prerm
+
+      - name: Build package
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            ./scripts/build-ipk.sh "${GITHUB_REF_NAME#v}"
+          else
+            ./scripts/build-ipk.sh
+          fi
+          cp dist/netbird-bridge_*_all.ipk dist/netbird-bridge.ipk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netbird-bridge
+          path: dist/*.ipk
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/netbird-bridge_*_all.ipk dist/netbird-bridge.ipk \
+            --title "$GITHUB_REF_NAME" --generate-notes

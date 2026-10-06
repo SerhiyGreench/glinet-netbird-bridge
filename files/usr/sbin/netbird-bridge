@@ -1,0 +1,618 @@
+#!/bin/sh
+# netbird-bridge — present NetBird to the GL.iNet VPN client as a WireGuard server.
+#
+# NetBird runs inside its own network namespace. A WireGuard interface is
+# created in the main namespace (so its UDP socket listens there, reachable on
+# 127.0.0.1) and then moved into NetBird's namespace. GL.iNet's WireGuard client
+# connects to it like any other server; whatever it sends comes out inside the
+# namespace and is routed into NetBird, and nowhere else.
+
+# shellcheck source=/dev/null
+. /lib/functions.sh
+
+VERSION="@VERSION@"
+CONFIG=netbird-bridge
+NB=/usr/bin/netbird
+STATE_DIR=/etc/netbird-bridge
+NB_STATE_DIR="$STATE_DIR/netbird"
+VETH_HOST=nbv0
+VETH_NS=nbv1
+WG_IF=nbwg0
+NB_IF=wt0
+FW_ZONE=nbbridge
+NFT_TABLE=netbird_bridge
+
+log() { logger -t netbird-bridge "$*"; }
+say() { printf '%s\n' "$*"; }
+die() { printf 'netbird-bridge: %s\n' "$*" >&2; exit 1; }
+
+load_config() {
+	config_load "$CONFIG"
+	config_get NS main netns nbns
+	config_get PORT main listen_port 51830
+	config_get TUN_IP main tunnel_ip 10.211.83.1/30
+	config_get CLIENT_IP main client_ip 10.211.83.2
+	config_get HOST_IP main veth_host_ip 169.254.83.1/30
+	config_get NS_IP main veth_ns_ip 169.254.83.2/30
+	config_get MTU main mtu 1280
+	config_get UPSTREAM_DNS main upstream_dns "1.1.1.1 9.9.9.9"
+	config_get EXIT_NODE main exit_node auto
+	config_get PROFILE_NAME main profile_name NetBird
+	config_get LAN_DNS main lan_dns 1
+	config_get SERVER_KEY main server_private_key
+	config_get CLIENT_KEY main client_private_key
+	config_get GL_GROUP main gl_group_id
+	config_get GL_PEER main gl_peer_id
+	TUN_ADDR="${TUN_IP%/*}"
+	HOST_ADDR="${HOST_IP%/*}"
+}
+
+nsx() { ip netns exec "$NS" "$@"; }
+nb() { nsx "$NB" "$@"; }
+ns_exists() { [ -e "/var/run/netns/$NS" ]; }
+
+# ---------------------------------------------------------------- keys
+
+ensure_keys() {
+	local changed=
+	[ -n "$SERVER_KEY" ] || { SERVER_KEY="$(wg genkey)"; uci set "$CONFIG.main.server_private_key=$SERVER_KEY"; changed=1; }
+	[ -n "$CLIENT_KEY" ] || { CLIENT_KEY="$(wg genkey)"; uci set "$CONFIG.main.client_private_key=$CLIENT_KEY"; changed=1; }
+	[ -n "$changed" ] && uci commit "$CONFIG"
+	SERVER_PUB="$(echo "$SERVER_KEY" | wg pubkey)"
+	CLIENT_PUB="$(echo "$CLIENT_KEY" | wg pubkey)"
+}
+
+# ---------------------------------------------------------------- namespace
+
+# Idempotent: creates what is missing, leaves what is there alone.
+net_up() {
+	ensure_keys
+	mkdir -p /var/run/netns "/etc/netns/$NS" "$NB_STATE_DIR"
+	chmod 700 "$STATE_DIR" "$NB_STATE_DIR"
+
+	# NetBird keeps its identity under /var/lib/netbird, which is tmpfs here.
+	if [ ! -L /var/lib/netbird ]; then
+		[ -d /var/lib/netbird ] && cp -a /var/lib/netbird/. "$NB_STATE_DIR/" 2>/dev/null && rm -rf /var/lib/netbird
+		mkdir -p /var/lib
+		ln -s "$NB_STATE_DIR" /var/lib/netbird
+	fi
+
+	ns_exists || ip netns add "$NS" || die "cannot create network namespace $NS"
+	nsx ip link set lo up
+	nsx sysctl -qw net.ipv4.ip_forward=1
+	nsx sysctl -qw net.ipv6.conf.all.disable_ipv6=1 2>/dev/null
+	nsx sysctl -qw net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
+
+	if ! ip link show "$VETH_HOST" >/dev/null 2>&1; then
+		ip link add "$VETH_HOST" type veth peer name "$VETH_NS" || die "cannot create veth pair (is kmod-veth installed?)"
+		ip link set "$VETH_NS" netns "$NS"
+	fi
+	# With TX checksum offload left on, flows the NSS/ECM fast path picks up
+	# across the veth lose packets after the handshake and stall.
+	ethtool -K "$VETH_HOST" tx off >/dev/null 2>&1
+	nsx ethtool -K "$VETH_NS" tx off >/dev/null 2>&1
+	ip addr replace "$HOST_IP" dev "$VETH_HOST"
+	ip link set "$VETH_HOST" up
+	nsx ip addr replace "$NS_IP" dev "$VETH_NS"
+	nsx ip link set "$VETH_NS" up
+	nsx ip route replace default via "$HOST_ADDR" dev "$VETH_NS"
+	# The router reaches NetBird's resolver over the namespace link. GL.iNet
+	# consults table 9910 before any VPN mark, so a tunnel never captures it.
+	ip route replace "$TUN_ADDR/32" via "${NS_IP%/*}" dev "$VETH_HOST"
+	ip route replace "$TUN_ADDR/32" via "${NS_IP%/*}" dev "$VETH_HOST" table 9910 2>/dev/null
+
+	if ! nsx ip link show "$WG_IF" >/dev/null 2>&1; then
+		ip link del "$WG_IF" 2>/dev/null
+		# Created here, so the UDP socket stays in the main namespace after the move.
+		ip link add "$WG_IF" type wireguard || die "cannot create WireGuard interface (is kmod-wireguard installed?)"
+		local kf
+		kf="$(mktemp)"
+		echo "$SERVER_KEY" > "$kf"
+		wg set "$WG_IF" listen-port "$PORT" private-key "$kf"
+		rm -f "$kf"
+		ip link set "$WG_IF" netns "$NS" || die "cannot move $WG_IF into $NS"
+	fi
+	nsx wg set "$WG_IF" peer "$CLIENT_PUB" allowed-ips "$CLIENT_IP/32"
+	nsx ip addr replace "$TUN_IP" dev "$WG_IF"
+	nsx ip link set "$WG_IF" mtu "$MTU" up
+
+	nsx nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft_up
+}
+
+# NetBird points this at its own resolver while it runs and restores it on a
+# clean exit; written fresh here so a crash cannot leave it pointing at nothing.
+write_resolv() {
+	local dns
+	mkdir -p "/etc/netns/$NS"
+	: > "/etc/netns/$NS/resolv.conf.new"
+	for dns in $UPSTREAM_DNS; do echo "nameserver $dns" >> "/etc/netns/$NS/resolv.conf.new"; done
+	mv "/etc/netns/$NS/resolv.conf.new" "/etc/netns/$NS/resolv.conf"
+	rm -f /etc/resolv.conf.original.netbird
+}
+
+nft_up() {
+	nsx nft -f - <<-EOF
+	table inet $NFT_TABLE
+	delete table inet $NFT_TABLE
+	table inet $NFT_TABLE {
+		chain input {
+			type filter hook input priority filter - 10; policy accept;
+			iifname "$WG_IF" ct state established,related accept
+			iifname "$WG_IF" meta l4proto { tcp, udp } th dport 53 accept
+			iifname "$WG_IF" meta l4proto icmp accept
+			iifname "$WG_IF" drop
+		}
+		chain forward {
+			type filter hook forward priority filter - 10; policy accept;
+			iifname "$WG_IF" oifname "$NB_IF" tcp flags syn tcp option maxseg size set rt mtu
+			oifname "$WG_IF" iifname "$NB_IF" tcp flags syn tcp option maxseg size set rt mtu
+			iifname "$WG_IF" oifname "$NB_IF" accept
+			oifname "$WG_IF" iifname "$NB_IF" ct state established,related accept
+			iifname "$WG_IF" drop
+			oifname "$WG_IF" drop
+		}
+		chain postrouting {
+			type nat hook postrouting priority srcnat; policy accept;
+			oifname "$NB_IF" ip saddr $CLIENT_IP masquerade
+		}
+	}
+	EOF
+}
+
+net_down() {
+	# Its UDP socket lives in the main namespace until the interface itself goes,
+	# which a namespace with a NetBird still exiting inside would delay.
+	ns_exists && nsx ip link del "$WG_IF" 2>/dev/null
+	ns_exists && ip netns del "$NS"
+	ip link del "$VETH_HOST" 2>/dev/null
+	ip link del "$WG_IF" 2>/dev/null
+	return 0
+}
+
+# ---------------------------------------------------------------- host firewall
+
+# The namespace reaches the internet through the router like a LAN would:
+# its own zone, forwarded to wan, masqueraded by wan. Nothing it sends is
+# marked, so GL.iNet's VPN policy never routes it into a tunnel.
+firewall_up() {
+	if [ "$(uci -q get firewall.$FW_ZONE)" != zone ]; then
+		uci -q batch <<-EOF
+		set firewall.$FW_ZONE=zone
+		set firewall.$FW_ZONE.name=$FW_ZONE
+		add_list firewall.$FW_ZONE.device=$VETH_HOST
+		set firewall.$FW_ZONE.input=REJECT
+		set firewall.$FW_ZONE.output=ACCEPT
+		set firewall.$FW_ZONE.forward=REJECT
+		set firewall.${FW_ZONE}_wan=forwarding
+		set firewall.${FW_ZONE}_wan.src=$FW_ZONE
+		set firewall.${FW_ZONE}_wan.dest=wan
+		commit firewall
+		EOF
+		/etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+}
+
+firewall_down() {
+	if uci -q get firewall.$FW_ZONE >/dev/null; then
+		uci -q delete firewall.$FW_ZONE
+		uci -q delete firewall.${FW_ZONE}_wan
+		uci commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+}
+
+# ---------------------------------------------------------------- GL.iNet profile
+
+next_free_id() { # <section prefix> <minimum>
+	local n="$2"
+	while uci -q get "wireguard.$1$n" >/dev/null; do n=$((n + 1)); done
+	echo "$n"
+}
+
+# Writes the same sections GL.iNet's own import writes (wg-client check_config/confirm_config).
+profile_up() {
+	ensure_keys
+	if [ -z "$GL_GROUP" ] || [ "$(uci -q get wireguard.group_"$GL_GROUP")" != groups ]; then
+		GL_GROUP="$(next_free_id group_ 7100)"
+		uci set "$CONFIG.main.gl_group_id=$GL_GROUP"
+	fi
+	if [ -z "$GL_PEER" ] || [ "$(uci -q get wireguard.peer_"$GL_PEER")" != peers ]; then
+		GL_PEER="$(next_free_id peer_ 7100)"
+		uci set "$CONFIG.main.gl_peer_id=$GL_PEER"
+	fi
+	uci commit "$CONFIG"
+
+	local g="wireguard.group_$GL_GROUP" p="wireguard.peer_$GL_PEER"
+	uci -q batch <<-EOF
+	set $g=groups
+	set $g.group_name='$PROFILE_NAME'
+	set $g.group_type=2
+	set $g.auth_type=0
+	set $p=peers
+	set $p.group_id=$GL_GROUP
+	set $p.name='$PROFILE_NAME'
+	set $p.address_v4=$CLIENT_IP/32
+	set $p.end_point=127.0.0.1:$PORT
+	set $p.private_key=$CLIENT_KEY
+	set $p.public_key=$SERVER_PUB
+	set $p.presharedkey_enable=0
+	set $p.allowed_ips=0.0.0.0/0
+	set $p.dns=$TUN_ADDR
+	set $p.persistent_keepalive=25
+	set $p.mtu=$MTU
+	set $p.local_access=0
+	set $p.type=0
+	set $p.masq=1
+	commit wireguard
+	EOF
+}
+
+profile_down() {
+	[ -n "$GL_PEER" ] && uci -q delete "wireguard.peer_$GL_PEER"
+	if [ -n "$GL_GROUP" ] && ! uci show wireguard 2>/dev/null | grep -q "\.group_id='$GL_GROUP'"; then
+		uci -q delete "wireguard.group_$GL_GROUP"
+	fi
+	uci commit wireguard
+	uci -q delete "$CONFIG.main.gl_group_id"
+	uci -q delete "$CONFIG.main.gl_peer_id"
+	uci commit "$CONFIG"
+}
+
+# ---------------------------------------------------------------- LAN DNS
+
+DNSMASQ_FILE=netbird-bridge.conf
+
+netbird_domain() {
+	nb status 2>/dev/null | sed -n 's/^FQDN: *[^.]*\.\(.*\)$/\1/p'
+}
+
+# Every dnsmasq instance (GL.iNet runs one per VPN tunnel) sends the NetBird
+# domain to NetBird's resolver; the files live on tmpfs and GL.iNet recreates
+# instances, so this is re-applied by the watcher.
+lan_dns_up() {
+	[ "$LAN_DNS" = 1 ] || return 0
+	local domain dir conf changed=
+	domain="$(netbird_domain)"
+	[ -n "$domain" ] || return 0
+	conf="server=/$domain/$TUN_ADDR
+rebind-domain-ok=/$domain/"
+	for dir in $(uci -q show dhcp | sed -n "s/^dhcp\.[^.]*\.confdir='\(.*\)'$/\1/p"); do
+		[ -d "$dir" ] || continue
+		[ "$(cat "$dir/$DNSMASQ_FILE" 2>/dev/null)" = "$conf" ] && continue
+		echo "$conf" > "$dir/$DNSMASQ_FILE"
+		changed=1
+	done
+	[ -n "$changed" ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1 && log "NetBird names ($domain) resolvable from the LAN"
+	return 0
+}
+
+lan_dns_down() {
+	local dir changed=
+	for dir in $(uci -q show dhcp | sed -n "s/^dhcp\.[^.]*\.confdir='\(.*\)'$/\1/p") /tmp/dnsmasq.d; do
+		[ -f "$dir/$DNSMASQ_FILE" ] && rm -f "$dir/$DNSMASQ_FILE" && changed=1
+	done
+	[ -n "$changed" ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	return 0
+}
+
+# ---------------------------------------------------------------- NetBird binary
+
+nb_arch() {
+	case "$(uname -m)" in
+		aarch64|arm64) echo arm64 ;;
+		x86_64) echo amd64 ;;
+		armv6*|armv7*) echo armv6 ;;
+		mips64*) grep -q 'mips64el\|mips64le' /etc/openwrt_release 2>/dev/null && echo mips64le_softfloat || echo mips64_softfloat ;;
+		mips*) grep -q 'mipsel' /etc/openwrt_release 2>/dev/null && echo mipsle_softfloat || echo mips_softfloat ;;
+		*) return 1 ;;
+	esac
+}
+
+latest_netbird() {
+	curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/netbirdio/netbird/releases/latest | sed 's#.*/tag/v##'
+}
+
+install_netbird() { # [version]
+	local v="${1:-latest}" arch tmp free
+	arch="$(nb_arch)" || die "unsupported CPU: $(uname -m)"
+	[ "$v" = latest ] && { v="$(latest_netbird)"; [ -n "$v" ] || die "cannot find the latest NetBird release"; }
+	v="${v#v}"
+	if [ -x "$NB" ] && "$NB" version 2>/dev/null | grep -qx "$v"; then
+		say "NetBird $v is already installed"
+		return 0
+	fi
+	free="$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')"
+	[ -n "$free" ] && [ "$free" -lt 60000 ] && die "need about 60 MB free on /overlay for NetBird, have $((free / 1024)) MB"
+	tmp="$(mktemp -d)"
+	say "Downloading NetBird $v ($arch)…"
+	curl -fsSL -o "$tmp/nb.tgz" "https://github.com/netbirdio/netbird/releases/download/v$v/netbird_${v}_linux_${arch}.tar.gz" \
+		|| { rm -rf "$tmp"; die "download failed"; }
+	tar -xzf "$tmp/nb.tgz" -C "$tmp" netbird || { rm -rf "$tmp"; die "cannot unpack NetBird"; }
+	"$tmp/netbird" version >/dev/null 2>&1 || { rm -rf "$tmp"; die "the downloaded NetBird does not run on this router"; }
+	mv "$tmp/netbird" "$NB.new" && chmod 755 "$NB.new" && mv "$NB.new" "$NB"
+	rm -rf "$tmp"
+	say "NetBird $("$NB" version) installed"
+}
+
+# ---------------------------------------------------------------- NetBird state
+
+nb_ready() { nb status 2>/dev/null | grep -q '^Management: Connected'; }
+
+wait_ready() { # <seconds>
+	local i=0
+	while [ "$i" -lt "$1" ]; do
+		nb_ready && return 0
+		sleep 2
+		i=$((i + 2))
+	done
+	return 1
+}
+
+# Network IDs of every exit node (0.0.0.0/0 route) the router has been given.
+exit_nodes() {
+	nb networks list 2>/dev/null | awk '
+		/^ *- ID:/ { id = $3 }
+		/^ *Network: *0\.0\.0\.0\/0/ { print id }'
+}
+
+selected_exit_node() {
+	nb networks list 2>/dev/null | awk '
+		/^ *- ID:/ { id = $3; net = "" }
+		/^ *Network:/ { net = $2 }
+		/^ *Status: *Selected/ && net == "0.0.0.0/0" { print id; exit }'
+}
+
+ensure_exit_node() {
+	case "$EXIT_NODE" in none|"") return 0 ;; esac
+	[ -n "$(selected_exit_node)" ] && return 0
+	local id
+	if [ "$EXIT_NODE" = auto ]; then
+		id="$(exit_nodes | head -n 1)"
+	else
+		id="$EXIT_NODE"
+	fi
+	[ -n "$id" ] || return 1
+	nb networks select --append "$id" >/dev/null 2>&1 && log "selected exit node $id"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_start() {
+	firewall_up
+	write_resolv
+	net_up
+	log "namespace $NS ready, bridge listening on 127.0.0.1:$PORT"
+}
+
+cmd_stop() {
+	net_down
+}
+
+# Runs under procd beside NetBird: repairs the namespace and keeps an exit node
+# selected. Cheap when nothing is wrong.
+cmd_tick() {
+	net_up >/dev/null 2>&1
+	nb_ready || return 0
+	ensure_exit_node
+	lan_dns_up
+}
+
+cmd_watch() {
+	while sleep 30; do
+		cmd_tick
+	done
+}
+
+cmd_up() { # --setup-key K | --setup-key-file F, --management-url U, [--hostname H]
+	local key='' keyfile='' url='' host='' tmpkey=''
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--setup-key) key="$2"; shift ;;
+			--setup-key-file) keyfile="$2"; shift ;;
+			--management-url) url="$2"; shift ;;
+			--hostname) host="$2"; shift ;;
+			*) die "up: unknown option $1" ;;
+		esac
+		shift
+	done
+	[ -x "$NB" ] || die "NetBird is not installed; run: netbird-bridge install-netbird"
+	/etc/init.d/netbird-bridge running || /etc/init.d/netbird-bridge start
+	local i=0
+	while [ ! -S /var/run/netbird.sock ] && [ "$i" -lt 20 ]; do sleep 1; i=$((i + 1)); done
+	[ -S /var/run/netbird.sock ] || die "NetBird daemon did not start; see: logread -e netbird"
+
+	if [ -z "$key" ] && [ -z "$keyfile" ] && nb status 2>/dev/null | grep -q NeedsLogin; then
+		die "this router is not enrolled in NetBird yet; pass --setup-key KEY"
+	fi
+	if [ -n "$key" ]; then
+		tmpkey="$(mktemp)"
+		printf '%s' "$key" > "$tmpkey"
+		keyfile="$tmpkey"
+	fi
+	set -- up --dns-resolver-address "$TUN_ADDR:53" --disable-ipv6
+	[ -n "$keyfile" ] && set -- "$@" --setup-key-file "$keyfile"
+	[ -n "$url" ] && set -- "$@" --management-url "$url"
+	[ -n "$host" ] && set -- "$@" --hostname "$host"
+	nb "$@"
+	local rc=$?
+	[ -n "$tmpkey" ] && rm -f "$tmpkey"
+	[ $rc -eq 0 ] || die "netbird up failed"
+
+	wait_ready 60 || die "NetBird did not connect to its management server"
+	i=0
+	until ensure_exit_node; do
+		[ "$i" -ge 30 ] && { say "warning: no exit node is available to this router yet; traffic through the profile is blocked until one is"; break; }
+		sleep 2
+		i=$((i + 2))
+	done
+	lan_dns_up
+}
+
+cmd_setup() {
+	local nbver=latest key='' keyfile='' url='' host=''
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--netbird-version) nbver="$2"; shift ;;
+			--setup-key) key="$2"; shift ;;
+			--setup-key-file) keyfile="$2"; shift ;;
+			--management-url) url="$2"; shift ;;
+			--hostname) host="$2"; shift ;;
+			*) die "setup: unknown option $1" ;;
+		esac
+		shift
+	done
+	install_netbird "$nbver"
+	ensure_keys
+	firewall_up
+	profile_up
+	/etc/init.d/netbird-bridge enable
+	/etc/init.d/netbird-bridge restart
+	set --
+	[ -n "$key" ] && set -- "$@" --setup-key "$key"
+	[ -n "$keyfile" ] && set -- "$@" --setup-key-file "$keyfile"
+	[ -n "$url" ] && set -- "$@" --management-url "$url"
+	[ -n "$host" ] && set -- "$@" --hostname "$host"
+	cmd_up "$@"
+	say ""
+	cmd_status
+	say ""
+	say "Done. In the GL.iNet admin panel open VPN > WireGuard Client, pick"
+	say "\"$PROFILE_NAME\" and connect. Every GL.iNet VPN option applies to it."
+}
+
+cmd_status() {
+	say "netbird-bridge $VERSION"
+	if ns_exists && nsx ip link show "$WG_IF" >/dev/null 2>&1; then
+		say "Bridge:       up, 127.0.0.1:$PORT -> namespace $NS"
+		local hs
+		hs="$(nsx wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -n | tail -n 1)"
+		if [ -n "$hs" ] && [ "$hs" != 0 ]; then
+			say "GL.iNet peer: last handshake $(( $(date +%s) - hs ))s ago"
+		else
+			say "GL.iNet peer: no handshake (profile \"$PROFILE_NAME\" not connected)"
+		fi
+	else
+		say "Bridge:       down"
+	fi
+	if [ -S /var/run/netbird.sock ]; then
+		nb status 2>/dev/null | grep -E '^(Management|Signal|Relays|NetBird IP|Interface type|Peers count):' | sed 's/^/NetBird  /'
+		local ex
+		ex="$(selected_exit_node)"
+		say "Exit node:    ${ex:-none selected}"
+	else
+		say "NetBird:      not running"
+	fi
+}
+
+# Proves the path end to end without touching GL.iNet: a throwaway client in
+# its own namespace connects to the bridge exactly as GL.iNet's client would.
+cmd_selftest() {
+	# Outside the bridge's own subnet, so it can be neither of its addresses nor its broadcast.
+	local t=nbtest$$ key pub kf ip ok=0 addr="${CLIENT_IP%.*}.$(( ${CLIENT_IP##*.} + 4 ))"
+	ns_exists || die "bridge is not running"
+	ensure_keys
+	key="$(wg genkey)"
+	pub="$(echo "$key" | wg pubkey)"
+	ip netns add "$t" || die "cannot create test namespace"
+	mkdir -p "/etc/netns/$t"
+	echo "nameserver $TUN_ADDR" > "/etc/netns/$t/resolv.conf"
+	ip link add "${t}w" type wireguard
+	kf="$(mktemp)"
+	echo "$key" > "$kf"
+	wg set "${t}w" private-key "$kf" peer "$SERVER_PUB" endpoint "127.0.0.1:$PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+	rm -f "$kf"
+	ip link set "${t}w" netns "$t"
+	nsx wg set "$WG_IF" peer "$pub" allowed-ips "$addr/32"
+	nsx ip route add "$addr/32" dev "$WG_IF"
+	nsx nft add rule inet "$NFT_TABLE" postrouting oifname "$NB_IF" ip saddr "$addr" masquerade
+	ip netns exec "$t" ip link set lo up
+	ip netns exec "$t" ip addr add "$addr/32" dev "${t}w"
+	ip netns exec "$t" ip link set "${t}w" mtu "$MTU" up
+	ip netns exec "$t" ip route add default dev "${t}w"
+
+	say "DNS through the bridge ($TUN_ADDR):"
+	if ip netns exec "$t" nslookup example.com "$TUN_ADDR" 2>/dev/null | grep -q '^Address: *[0-9]*\.[0-9]'; then
+		say "  ok"; ok=$((ok + 1))
+	else
+		say "  FAILED"
+	fi
+	say "Public IP through the bridge:"
+	if ip="$(ip netns exec "$t" curl -fsS -m 15 https://api.ipify.org 2>/dev/null)"; then
+		say "  $ip"; ok=$((ok + 1))
+	else
+		say "  FAILED"
+	fi
+	say "The router's own public IP, for comparison:"
+	say "  $(curl -fsS -m 10 https://api.ipify.org 2>/dev/null || echo unknown)"
+
+	nsx wg set "$WG_IF" peer "$pub" remove
+	nsx ip route del "$addr/32" dev "$WG_IF" 2>/dev/null
+	nft_up
+	ip netns del "$t"
+	rm -rf "/etc/netns/$t"
+	[ "$ok" -eq 2 ]
+}
+
+cmd_uninstall() { # [--purge]
+	/etc/init.d/netbird-bridge stop 2>/dev/null
+	/etc/init.d/netbird-bridge disable 2>/dev/null
+	lan_dns_down
+	profile_down
+	firewall_down
+	net_down
+	if [ "$1" = --purge ]; then
+		rm -f "$NB"
+		rm -rf "$STATE_DIR" /var/lib/netbird "/etc/netns/$NS"
+	fi
+}
+
+usage() {
+	cat <<-EOF
+	netbird-bridge $VERSION — NetBird as a GL.iNet WireGuard client profile
+
+	  setup --setup-key KEY [--management-url URL] [--hostname NAME] [--netbird-version V]
+	                     install NetBird, enroll, create the GL.iNet profile (idempotent)
+	  up [--setup-key KEY] [--management-url URL]
+	                     (re)enroll NetBird
+	  status             bridge, NetBird and exit-node state
+	  selftest           send traffic through the bridge from a throwaway client
+	  exit-node [ID|auto|none]
+	                     show exit nodes, or choose one (auto = first available)
+	  profile            recreate the GL.iNet WireGuard profile
+	  install-netbird [VERSION]
+	                     install or update the NetBird binary (default: latest)
+	  netbird ARGS...    run the NetBird CLI inside the bridge namespace
+	  uninstall [--purge]
+	                     remove profile, firewall zone and namespace (--purge: NetBird too)
+	EOF
+}
+
+load_config
+cmd="$1"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+	setup) cmd_setup "$@" ;;
+	up) cmd_up "$@" ;;
+	status) cmd_status ;;
+	selftest) cmd_selftest ;;
+	profile) profile_up && say "profile \"$PROFILE_NAME\" written" ;;
+	install-netbird) install_netbird "$@" ;;
+	netbird|nb) nb "$@" ;;
+	exit-node)
+		case "$1" in
+			"") nb networks list; say ""; say "selected: $(selected_exit_node)" ;;
+			*) uci set "$CONFIG.main.exit_node=$1"; uci commit "$CONFIG"; EXIT_NODE="$1"
+				if [ "$1" != auto ]; then
+					for id in $(exit_nodes); do nb networks deselect "$id" >/dev/null 2>&1; done
+				fi
+				ensure_exit_node
+				say "selected: $(selected_exit_node)" ;;
+		esac ;;
+	_start) cmd_start ;;
+	_stop) cmd_stop ;;
+	_watch) cmd_watch ;;
+	_tick) cmd_tick ;;
+	uninstall) cmd_uninstall "$@" ;;
+	version|--version) say "$VERSION" ;;
+	*) usage; [ -z "$cmd" ] || [ "$cmd" = help ] || [ "$cmd" = --help ] || exit 1 ;;
+esac
