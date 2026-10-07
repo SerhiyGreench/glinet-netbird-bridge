@@ -436,7 +436,7 @@ cmd_up() { # --setup-key K | --setup-key-file F, --management-url U, [--hostname
 	nb "$@"
 	local rc=$?
 	[ -n "$tmpkey" ] && rm -f "$tmpkey"
-	[ $rc -eq 0 ] || die "netbird up failed"
+	[ $rc -eq 0 ] || die "netbird up failed; once fixed, run: netbird-bridge up --setup-key KEY [--management-url URL]"
 
 	wait_ready 60 || die "NetBird did not connect to its management server"
 	i=0
@@ -466,7 +466,8 @@ cmd_setup() {
 	firewall_up
 	profile_up
 	/etc/init.d/netbird-bridge enable
-	/etc/init.d/netbird-bridge restart
+	/etc/init.d/netbird-bridge stop >/dev/null 2>&1
+	/etc/init.d/netbird-bridge start
 	set --
 	[ -n "$key" ] && set -- "$@" --setup-key "$key"
 	[ -n "$keyfile" ] && set -- "$@" --setup-key-file "$keyfile"
@@ -562,7 +563,7 @@ cmd_uninstall() { # [--purge]
 	net_down
 	if [ "$1" = --purge ]; then
 		rm -f "$NB"
-		rm -rf "$STATE_DIR" /var/lib/netbird "/etc/netns/$NS"
+		rm -rf "$STATE_DIR" /var/lib/netbird "/etc/netns/$NS" /etc/config/netbird-bridge
 	fi
 }
 
