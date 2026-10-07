@@ -1,5 +1,8 @@
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
+# Every option has its default in the script, so opkg's copy of a newer
+# default file is of no use beside the config that holds this router's keys.
+rm -f /etc/config/netbird-bridge-opkg
 /etc/init.d/netbird-bridge enable
 # An upgrade restarts a bridge that was already set up; a first install waits for `netbird-bridge setup`.
 [ -x /usr/bin/netbird ] && /etc/init.d/netbird-bridge restart
