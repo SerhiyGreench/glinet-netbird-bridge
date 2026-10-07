@@ -18,5 +18,5 @@ config bridge 'main'
 	option netns 'nbns'
 	# Resolvers NetBird itself uses to reach its management server.
 	option upstream_dns '1.1.1.1 9.9.9.9'
-	# Resolve NetBird peer names (e.g. peer.netbird.cloud) from every LAN device.
+	# Resolve NetBird peer names and DNS zones from every LAN device.
 	option lan_dns '1'

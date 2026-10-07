@@ -261,28 +261,53 @@ profile_down() {
 # ---------------------------------------------------------------- LAN DNS
 
 DNSMASQ_FILE=netbird-bridge.conf
+ZONES_FILE="$STATE_DIR/dns-zones"
 
 netbird_domain() {
 	nb status 2>/dev/null | sed -n 's/^FQDN: *[^.]*\.\(.*\)$/\1/p'
 }
 
-# Every dnsmasq instance (GL.iNet runs one per VPN tunnel) sends the NetBird
-# domain to NetBird's resolver; the files live on tmpfs and GL.iNet recreates
-# instances, so this is re-applied by the watcher.
+# NetBird reports neither its custom DNS zones nor its nameserver groups'
+# domains anywhere but in the network map of a debug bundle, and only keeps
+# that map while sync persistence is on. The list is cached on flash so it
+# applies at boot, before NetBird's first sync.
+refresh_zones() {
+	local bundle zones
+	nb debug persistence on >/dev/null 2>&1
+	bundle="$(nb debug bundle --system-info=false 2>/dev/null | grep -o '/[^ ]*\.zip' | tail -n 1)"
+	[ -n "$bundle" ] || return 1
+	zones="$(unzip -p "$bundle" network_map.json 2>/dev/null | jq -r '
+		.NetworkMap.DNSConfig // {} |
+		([.CustomZones[]?.Domain] + [.NameServerGroups[]?.Domains[]?])[] |
+		rtrimstr(".") | select(length > 0)' 2>/dev/null | sort -u)"
+	rm -f "$bundle"
+	[ -n "$zones" ] || return 1
+	[ "$zones" = "$(cat "$ZONES_FILE" 2>/dev/null)" ] && return 0
+	echo "$zones" > "$ZONES_FILE"
+	log "NetBird DNS zones: $(echo "$zones" | tr '\n' ' ')"
+}
+
+dns_zones() {
+	{ cat "$ZONES_FILE" 2>/dev/null; netbird_domain; } | grep . | sort -u
+}
+
+# Every dnsmasq instance (GL.iNet runs one per VPN tunnel) sends the domains
+# NetBird answers for to NetBird's resolver; the files live on tmpfs and
+# GL.iNet recreates instances, so this is re-applied by the watcher.
 lan_dns_up() {
 	[ "$LAN_DNS" = 1 ] || return 0
-	local domain dir conf changed=
-	domain="$(netbird_domain)"
-	[ -n "$domain" ] || return 0
-	conf="server=/$domain/$TUN_ADDR
-rebind-domain-ok=/$domain/"
+	local zones dir conf changed=''
+	zones="$(dns_zones | tr '\n' '/')"
+	[ -n "$zones" ] || return 0
+	conf="server=/$zones$TUN_ADDR
+rebind-domain-ok=/$zones"
 	for dir in $(uci -q show dhcp | sed -n "s/^dhcp\.[^.]*\.confdir='\(.*\)'$/\1/p"); do
 		[ -d "$dir" ] || continue
 		[ "$(cat "$dir/$DNSMASQ_FILE" 2>/dev/null)" = "$conf" ] && continue
 		echo "$conf" > "$dir/$DNSMASQ_FILE"
 		changed=1
 	done
-	[ -n "$changed" ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1 && log "NetBird names ($domain) resolvable from the LAN"
+	[ -n "$changed" ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1 && log "LAN resolves through NetBird: $zones"
 	return 0
 }
 
@@ -394,12 +419,16 @@ cmd_tick() {
 	net_up >/dev/null 2>&1
 	nb_ready || return 0
 	ensure_exit_node
+	[ "$1" = zones ] && refresh_zones
 	lan_dns_up
 }
 
 cmd_watch() {
+	local n=0
 	while sleep 30; do
-		cmd_tick
+		# Zones change rarely and a bundle costs a few seconds: every 10 minutes.
+		if [ $((n % 20)) -eq 0 ]; then cmd_tick zones; else cmd_tick; fi
+		n=$((n + 1))
 	done
 }
 
@@ -429,6 +458,7 @@ cmd_up() { # --setup-key K | --setup-key-file F, --management-url U, [--hostname
 		printf '%s' "$key" > "$tmpkey"
 		keyfile="$tmpkey"
 	fi
+	nb debug persistence on >/dev/null 2>&1
 	set -- up --dns-resolver-address "$TUN_ADDR:53" --disable-ipv6
 	[ -n "$keyfile" ] && set -- "$@" --setup-key-file "$keyfile"
 	[ -n "$url" ] && set -- "$@" --management-url "$url"
@@ -445,6 +475,8 @@ cmd_up() { # --setup-key K | --setup-key-file F, --management-url U, [--hostname
 		sleep 2
 		i=$((i + 2))
 	done
+	i=0
+	until refresh_zones || [ "$i" -ge 10 ]; do sleep 2; i=$((i + 2)); done
 	lan_dns_up
 }
 
@@ -612,7 +644,7 @@ case "$cmd" in
 	_start) cmd_start ;;
 	_stop) cmd_stop ;;
 	_watch) cmd_watch ;;
-	_tick) cmd_tick ;;
+	_tick) cmd_tick "$@" ;;
 	uninstall) cmd_uninstall "$@" ;;
 	version|--version) say "$VERSION" ;;
 	*) usage; [ -z "$cmd" ] || [ "$cmd" = help ] || [ "$cmd" = --help ] || exit 1 ;;

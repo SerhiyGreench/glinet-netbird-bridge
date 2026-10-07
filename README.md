@@ -83,10 +83,14 @@ netbird-bridge setup --setup-key <YOUR-SETUP-KEY> [--management-url <URL>]
 - **NetBird's own encrypted traffic** leaves through a veth pair into a small
   firewall zone (`nbbridge`) forwarded to `wan`. GL.iNet's VPN policy only marks
   traffic from LAN interfaces, so this never ends up inside a tunnel.
-- **NetBird names resolve on the LAN.** The profile's DNS is NetBird's resolver.
-  Every dnsmasq instance on the router also forwards the NetBird domain (for
-  example `netbird.cloud`) there, so `peer.netbird.cloud` resolves from any
-  device, on the VPN or not.
+- **NetBird's DNS works on the LAN.** The profile's DNS is NetBird's resolver.
+  Every dnsmasq instance on the router also sends NetBird's domains there: the
+  peer domain (for example `netbird.cloud`), every custom DNS zone, and the match
+  domains of every nameserver group. So `peer.netbird.cloud` and
+  `app.internal.example.com` resolve from any device, on the VPN or not. NetBird
+  reports these domains only in the network map of a debug bundle. The watcher
+  reads them from there every 10 minutes and caches them in
+  `/etc/netbird-bridge/dns-zones` so they apply at boot.
 - **A watcher** checks every 30 seconds and puts back whatever went missing:
   the namespace after a network restart, the dnsmasq rules after GL.iNet
   recreates an instance, and an exit-node selection.
@@ -133,7 +137,7 @@ changed the port, MTU or addresses.
 |---|---|---|
 | `profile_name` | `NetBird` | Name of the profile in the GL.iNet UI |
 | `exit_node` | `auto` | `auto`, `none`, or a NetBird network ID |
-| `lan_dns` | `1` | Resolve NetBird names from every LAN device |
+| `lan_dns` | `1` | Resolve NetBird names and DNS zones from every LAN device |
 | `listen_port` | `51830` | Bridge port on `127.0.0.1` |
 | `mtu` | `1280` | Matches NetBird's interface |
 | `tunnel_ip` / `client_ip` | `10.211.83.1/30` / `10.211.83.2` | Addresses inside the bridge; change them if NetBird routes this range |

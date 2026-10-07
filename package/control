@@ -1,6 +1,6 @@
 Package: netbird-bridge
 Version: @VERSION@
-Depends: libc, ip-full, kmod-veth, kmod-wireguard, wireguard-tools, nftables, ethtool, curl, ca-bundle
+Depends: libc, ip-full, kmod-veth, kmod-wireguard, wireguard-tools, nftables, ethtool, curl, ca-bundle, jq, unzip
 Source: https://github.com/SerhiyGreench/glinet-netbird-bridge
 SourceName: netbird-bridge
 License: MIT
